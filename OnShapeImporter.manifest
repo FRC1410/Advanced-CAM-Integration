@@ -1,0 +1,9 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "author": "FRC Team",
+  "description": "Import OnShape parts from queue file into Fusion 360",
+  "version": "1.0.0",
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}
