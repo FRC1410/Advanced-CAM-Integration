@@ -457,6 +457,7 @@ class App(tk.Tk):
         self.export_queue: list = []
         # item_id → metadata dict (for tree nodes)
         self._node_meta: dict = {}
+        self._material_all_label = "All Materials"
 
         # Parts cache — serves parts/thickness from disk if microversion unchanged
         _cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -681,15 +682,15 @@ class App(tk.Tk):
         mat_row.pack(fill=tk.X, padx=6, pady=(2, 6))
         tk.Label(mat_row, text="Material:", bg="#f0f0f0",
                  width=10, anchor=tk.W).pack(side=tk.LEFT)
-        self._material_filter_var = tk.StringVar()
+        self._material_filter_var = tk.StringVar(value=self._material_all_label)
         self._material_filter_var.trace_add("write", self._apply_filter)
         self._material_combo = ttk.Combobox(mat_row,
                                              textvariable=self._material_filter_var,
-                                             values=[""],
+                                             values=[self._material_all_label],
                                              state="readonly", width=20)
         self._material_combo.pack(side=tk.LEFT, padx=4)
         tk.Button(mat_row, text="✕", width=2, relief=tk.FLAT,
-                  command=lambda: self._material_filter_var.set("")).pack(side=tk.LEFT)
+                  command=lambda: self._material_filter_var.set(self._material_all_label)).pack(side=tk.LEFT)
 
         # Tree
         tree_frame = tk.Frame(frame, bg="#f0f0f0")
@@ -1224,7 +1225,7 @@ class App(tk.Tk):
         for part in parts:
             pid      = part.get("partId", "")
             pname    = part.get("name", "Unnamed Part")
-            material = (part.get("material") or {}).get("displayName", "")
+            material = self._format_material(part)
             hidden   = part.get("isHidden", False)
             if hidden:
                 continue
@@ -1263,6 +1264,27 @@ class App(tk.Tk):
         if not from_cache or not bboxes:
             self._queue_thickness_for_node(parent_node)
 
+    def _format_material(self, part:dict): 
+        """Normalize material labels from OnShape part data"""
+        raw  = part.get("material")
+        label = ""
+        if isinstance(raw, dict):
+            label = raw.get("displayName") or raw.get("name") or raw.get("id") or ""
+        elif isinstance(raw, str):
+            label = raw
+        if not label:
+            props = part.get("properties")
+            if isinstance(props, list):
+                for prop in props:
+                    if not isinstance(prop, dict):
+                        continue
+                    pname = (prop.get("name") or prop.get("displayName") or "").strip().lower()
+                    if pname == "material" or prop.get("displayName") in pname:
+                        label = prop.get("displayValue") or prop.get("value") or prop.get("displayName") or ""
+                        break
+        label = " ".join(label.split())
+        return label
+
     def _update_thickness(self, node, thickness_str: str, thickness_val):
         """Update the thickness column for a tree node."""
         try:
@@ -1283,7 +1305,8 @@ class App(tk.Tk):
 
     def _apply_filter(self, *_):
         name_query = self._filter_var.get().strip().lower()
-        mat_query  = self._material_filter_var.get().strip().lower()
+        raw_mat = self._material_filter_var.get().strip().lower()
+        mat_query  = "" if not raw_mat or raw_mat == self._material_all_label.lower() else raw_mat # self._material_filter_var.get().strip().lower()
 
         # Collect all unique materials from parts for the dropdown
         materials = sorted(set(
@@ -1294,9 +1317,11 @@ class App(tk.Tk):
             ) if m
         ))
         current_vals = list(self._material_combo["values"])
-        new_vals = [""] + materials
+        new_vals = [self._material_all_label] + materials
         if new_vals != current_vals:
             self._material_combo["values"] = new_vals
+            if self._material_filter_var.get() not in new_vals:
+                self._material_filter_var.set(self._material_all_label)
 
         # Reset tags
         for node, meta in self._node_meta.items():
@@ -1479,7 +1504,10 @@ class App(tk.Tk):
                 if self._node_meta[n].get("type") == "part"
             ) if m
         ))
-        self._material_combo["values"] = [""] + materials
+        values = [self._material_all_label] + materials
+        self._material_combo["values"] = [""] + values
+        if self._material_filter_var not in values:
+            self._material_filter_var.set(self._material_all_label)
 
     # ------------------------------------------------------------------
     # Export queue (right panel)
