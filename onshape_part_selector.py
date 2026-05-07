@@ -316,7 +316,7 @@ class OnShapeClient:
                 return ids[0]
             if state == "FAILED":
                 raise RuntimeError(f"OnShape translation failed: {status}")
-            time.sleep(2)
+            time.sleep(5)   # 5s interval — saves ~60% of poll calls vs 2s
         raise TimeoutError("STEP export timed out after 120 seconds.")
 
     def download_step(self, did: str, external_data_id: str) -> bytes:
@@ -341,6 +341,83 @@ def parse_onshape_url(url: str):
         wid.group(1) if wid else None,
         eid.group(1) if eid else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Parts Cache — avoids repeated API calls for unchanged documents
+# ---------------------------------------------------------------------------
+
+class PartsCache:
+    """
+    Caches get_parts and bodydetails results to disk, keyed by
+    (element_id + workspace_id + microversion). If the document
+    hasn't changed since the last fetch, parts and thickness are
+    served from cache with zero API calls.
+
+    Cache file: onshape_parts_cache.json (next to the script).
+    """
+
+    def __init__(self, cache_path: str):
+        self._path = cache_path
+        self._data: dict = {}
+        self._load()
+
+    def _load(self):
+        try:
+            if os.path.exists(self._path):
+                with open(self._path) as f:
+                    self._data = json.load(f)
+        except Exception:
+            self._data = {}
+
+    def _save(self):
+        try:
+            with open(self._path, "w") as f:
+                json.dump(self._data, f, indent=2)
+        except Exception:
+            pass
+
+    def _key(self, element_id: str, workspace_id: str, microversion: str) -> str:
+        return f"{element_id}:{workspace_id}:{microversion}"
+
+    def get_parts(self, element_id: str, workspace_id: str,
+                  microversion: str) -> list | None:
+        """Return cached parts list, or None if not cached / stale."""
+        entry = self._data.get(self._key(element_id, workspace_id, microversion))
+        return entry.get("parts") if entry else None
+
+    def get_thickness(self, element_id: str, workspace_id: str,
+                      microversion: str) -> dict | None:
+        """Return cached thickness dict, or None if not cached / stale."""
+        entry = self._data.get(self._key(element_id, workspace_id, microversion))
+        return entry.get("thickness") if entry else None
+
+    def save(self, element_id: str, workspace_id: str, microversion: str,
+             parts: list = None, thickness: dict = None):
+        """Save parts and/or thickness data for this element version."""
+        key = self._key(element_id, workspace_id, microversion)
+        entry = self._data.get(key, {})
+        if parts is not None:
+            entry["parts"] = parts
+        if thickness is not None:
+            entry["thickness"] = thickness
+        self._data[key] = entry
+
+        # Prune stale entries — only keep entries whose microversion
+        # matches what we've seen recently (keep last 200 entries)
+        if len(self._data) > 200:
+            keys = list(self._data.keys())
+            for old_key in keys[:-200]:
+                self._data.pop(old_key, None)
+
+        self._save()
+
+    def invalidate_element(self, element_id: str):
+        """Remove all cache entries for an element (all versions)."""
+        stale = [k for k in self._data if k.startswith(f"{element_id}:")]
+        for k in stale:
+            self._data.pop(k)
+        self._save()
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +447,15 @@ class App(tk.Tk):
         self.export_queue: list = []
         # item_id → metadata dict (for tree nodes)
         self._node_meta: dict = {}
+
+        # Parts cache — serves parts/thickness from disk if microversion unchanged
+        _cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "onshape_parts_cache.json")
+        self._cache = PartsCache(_cache_path)
+        # element_id → microversion string (populated when elements load)
+        self._element_microversions: dict = {}
+        # element_ids whose parts have already been loaded this session
+        self._parts_loaded: set = set()
 
         self._load_config()
         self._build_ui()
@@ -633,7 +719,9 @@ class App(tk.Tk):
         self._tree.tag_configure("assembly",   foreground="#4a148c")
         self._tree.tag_configure("error",      foreground="#c62828")
         self._tree.tag_configure("match",      foreground="#000000",
-                                  background="#fff176")  # yellow highlight
+                                  background="#fff176")
+        self._tree.tag_configure("hint",       foreground="#aaaaaa",
+                                  font=("Arial", 9, "italic"))  # yellow highlight
 
         # Add button
         tk.Button(frame, text="→  Add Selected to Export List",
@@ -976,11 +1064,19 @@ class App(tk.Tk):
         self._thickness_loaded.clear()
         self._thickness_queue.clear()
         self._thickness_busy = False
+        self._parts_loaded.clear()
+        self._element_microversions.clear()
         self._set_status(f"Loading {doc_name}…")
 
         def worker():
             try:
                 elements = self.client.get_elements(did, wid)
+                # Capture per-element microversion for cache keying
+                for el in elements:
+                    eid = el.get("id", "")
+                    mv  = el.get("microversionId", el.get("dataVersion", ""))
+                    if eid and mv:
+                        self._element_microversions[eid] = mv
                 self.after(0, lambda: self._populate_tree(elements, did, wid))
             except Exception as e:
                 self.after(0, lambda: self._set_status(f"Error loading document: {e}"))
@@ -1042,26 +1138,58 @@ class App(tk.Tk):
                     "element_name": ename,
                 }
 
-                # Eagerly load parts for Part Studios (parts list only, no thickness yet)
+                # Opt 1: LAZY loading — don't call get_parts for every studio
+                # immediately. Just insert a placeholder so the tree shows the
+                # expand arrow. Parts load only when the user expands the node.
                 if type_key == "PARTSTUDIO":
-                    self._fetch_parts(el_node, did, wid, eid, ename)
+                    self._tree.insert(el_node, tk.END,
+                                      text="  (expand to load parts)",
+                                      values=("", "", ""),
+                                      tags=("hint",))
 
         count = len(elements)
         self._set_status(f"Loaded {count} element{'s' if count != 1 else ''}.")
 
     def _fetch_parts(self, parent_node, did: str, wid: str,
                      eid: str, element_name: str):
-        """Load parts list immediately. Thickness fetched lazily on expand."""
+        """
+        Load parts for a Part Studio — checks disk cache first.
+        If cache hit (microversion unchanged), zero API calls needed.
+        After inserting parts, queues thickness loading.
+        """
+        # Remove the expand-to-load placeholder
+        for child in self._tree.get_children(parent_node):
+            try:
+                if "hint" in self._tree.item(child, "tags"):
+                    self._tree.delete(child)
+            except Exception:
+                pass
+
         placeholder = self._tree.insert(parent_node, tk.END,
                                          text="  ⏳ Loading parts…",
                                          values=("", "", ""))
 
         def worker():
+            mv = self._element_microversions.get(eid, "")
+
+            # Opt 3: Check cache
+            cached_parts = self._cache.get_parts(eid, wid, mv) if mv else None
+
+            if cached_parts is not None:
+                cached_thick = self._cache.get_thickness(eid, wid, mv) or {}
+                self.after(0, lambda: self._insert_parts(
+                    parent_node, placeholder, cached_parts, did, wid, eid,
+                    element_name, cached_thick, from_cache=True))
+                return
+
+            # Cache miss — fetch from OnShape
             try:
                 parts = self.client.get_parts(did, wid, eid)
+                if mv:
+                    self._cache.save(eid, wid, mv, parts=parts)
                 self.after(0, lambda: self._insert_parts(
                     parent_node, placeholder, parts, did, wid, eid,
-                    element_name, {}))
+                    element_name, {}, from_cache=False))
             except Exception as e:
                 self.after(0, lambda: self._tree.item(
                     placeholder, text=f"  ⚠ Error: {e}",
@@ -1071,7 +1199,7 @@ class App(tk.Tk):
 
     def _insert_parts(self, parent_node, placeholder, parts: list,
                       did: str, wid: str, eid: str, element_name: str,
-                      bboxes: dict):
+                      bboxes: dict, from_cache: bool = False):
         # Guard against race condition where tree was cleared before thread finished
         try:
             self._tree.delete(placeholder)
@@ -1091,18 +1219,13 @@ class App(tk.Tk):
             if hidden:
                 continue
 
-            # Compute thickness from bounding box (keyed by part name)
-            thickness_mm = None
+            # Apply thickness from cache if available
+            thickness_mm  = None
             thickness_str = "—"
-            bb = bboxes.get(pname, {})
-            if bb:
-                dx = abs(bb.get("xmax", 0) - bb.get("xmin", 0)) * 1000
-                dy = abs(bb.get("ymax", 0) - bb.get("ymin", 0)) * 1000
-                dz = abs(bb.get("zmax", 0) - bb.get("zmin", 0)) * 1000
-                dims = sorted([d for d in [dx, dy, dz] if d > 0.001])
-                if dims:
-                    thickness_mm = dims[0]
-                    thickness_str = f"{thickness_mm:.2f} mm"
+            cached = bboxes.get(pname, {})
+            if cached and cached.get("thickness_mm"):
+                thickness_mm  = cached["thickness_mm"]
+                thickness_str = self._fmt_thickness(thickness_mm)
 
             node = self._tree.insert(
                 parent_node, tk.END,
@@ -1125,6 +1248,10 @@ class App(tk.Tk):
 
         # Refresh material dropdown now that parts are loaded
         self._refresh_material_dropdown()
+
+        # Queue thickness loading — skipped if already loaded from cache
+        if not from_cache or not bboxes:
+            self._queue_thickness_for_node(parent_node)
 
     def _update_thickness(self, node, thickness_str: str, thickness_val):
         """Update the thickness column for a tree node."""
@@ -1202,13 +1329,27 @@ class App(tk.Tk):
             self._tree.selection_set(first_match)
 
     def _on_tree_expand(self, event):
-        """When a Part Studio node is expanded, queue its thickness load."""
+        """When a Part Studio node is expanded, load parts (lazy) then thickness."""
         node = self._tree.focus()
         meta = self._node_meta.get(node)
         node_type = meta.get("type", "unknown") if meta else "not-in-meta"
-        # Briefly show what node was expanded so we can see if event fires
-        self._set_status(f"Expanded: {node_type} — {meta.get('element_name','?') if meta else 'n/a'}")
-        self._queue_thickness_for_node(node)
+        self._set_status(f"Expanded: {node_type} — "
+                         f"{meta.get('element_name','?') if meta else 'n/a'}")
+
+        if not meta or meta.get("type") != "partstudio":
+            return
+
+        eid = meta.get("element_id", "")
+
+        # Load parts if not yet loaded for this studio
+        if eid not in self._parts_loaded:
+            self._parts_loaded.add(eid)
+            self._fetch_parts(node,
+                              meta["doc_id"], meta["workspace_id"],
+                              eid, meta["element_name"])
+        else:
+            # Parts already loaded — go straight to thickness
+            self._queue_thickness_for_node(node)
 
     def _queue_thickness_for_node(self, node):
         """Add a studio node to the thickness queue if not already loaded."""
@@ -1240,12 +1381,23 @@ class App(tk.Tk):
         ).start()
 
     def _fetch_thickness_for_studio(self, studio_node, did, wid, eid):
-        """Fetch bounding boxes for one studio, then process next in queue."""
+        """Fetch bounding boxes — checks cache first, saves result after."""
         try:
-            bboxes = self.client.get_part_bounding_boxes(did, wid, eid)
-            count = len(bboxes)
-            self.after(0, lambda: self._set_status(f"Got {count} thickness entries, applying…"))
-            self.after(0, lambda: self._apply_thickness(studio_node, bboxes))
+            mv = self._element_microversions.get(eid, "")
+
+            # Opt 3: check thickness cache
+            bboxes = self._cache.get_thickness(eid, wid, mv) if mv else None
+
+            if bboxes is None:
+                # Cache miss — call OnShape bodydetails
+                bboxes = self.client.get_part_bounding_boxes(did, wid, eid)
+                if mv and bboxes:
+                    self._cache.save(eid, wid, mv, thickness=bboxes)
+
+            count = len(bboxes) if bboxes else 0
+            self.after(0, lambda: self._set_status(
+                f"Got {count} thickness entries {'(cached)' if mv and self._cache.get_thickness(eid, wid, mv) is not None else '(from OnShape)'}, applying…"))
+            self.after(0, lambda: self._apply_thickness(studio_node, bboxes or {}))
         except Exception as e:
             err = str(e)[:80]
             self.after(0, lambda: self._set_status(f"Thickness error: {err}"))
