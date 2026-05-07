@@ -72,6 +72,16 @@ class OnShapeClient:
                          timeout=60)
         r.raise_for_status()
         return r.content
+    
+    def verify_connection(self) -> dict:
+        """
+        Checks that the API connection is working
+        Tries /sessioninfo, then /me
+        """
+        try:
+            return self.get("users/sessioninfo")
+        except Exception:
+            return self.get("users/me")
 
     # ---- Document helpers --------------------------------------------------
 
